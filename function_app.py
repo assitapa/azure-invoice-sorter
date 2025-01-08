@@ -193,10 +193,13 @@ def process_new_files(drive_service, new_file_ids):
             logging.error(f"Error processing file {file_id}: {str(e)}")
 
 
-@func.timer_trigger(schedule="0 * * * * * *",  # Runs every minute
-                   name="timer",
-                   run_on_startup=True)
-def main(mytimer: func.TimerRequest) -> None:
+@func.timer_trigger(
+    name="InvoiceProcessorTimer",  # Added name
+    schedule="0 */1 * * * *",      # Fixed CRON expression
+    run_on_startup=True,
+    connection="AzureWebJobsStorage"  # Added connection
+)
+async def main(mytimer: func.TimerRequest) -> None:  # Made async
     utc_timestamp = datetime.utcnow().replace(
         tzinfo=datetime.timezone.utc).isoformat()
     
