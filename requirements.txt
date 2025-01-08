@@ -3,10 +3,11 @@
 # Manually managing azure-functions-worker may cause unexpected issues
 
 azure-functions
+azure-storage-blob
 google-auth
 google-auth-httplib2
 google-api-python-client
+google-auth-oauthlib
 python-dotenv
-fitz
 PyMuPDF
 openai
