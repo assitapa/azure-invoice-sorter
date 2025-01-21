@@ -40,7 +40,7 @@ class PDFProcessor:
             logging.warning("Empty text provided to get_vendor_from_gpt")
             return None, None
 
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client = OpenAI(api_key=os.getenv("openai_api_key"))
 
         try:
             response = client.chat.completions.create(
