@@ -1,216 +1,231 @@
+"""
+Azure Functions for invoice sorting.
+"""
 import azure.functions as func
 import logging
-import json
 import os
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.discovery_cache.base import Cache
 from datetime import datetime, timezone
-from pdf_processor import PDFProcessor
-from file_organizer import FileOrganizer
-from azure.storage.blob import BlobServiceClient
+from services.drive_service import DriveService
+from services.blob_service import BlobService
+from services.pdf_service import PdfService
+from services.file_service import FileService
 
 # Constants
 FOLDER_ID = '1cfpB8Cgb_H1NXZ_sMaVXxJH1hYTwSJQ4'
-CONTAINER_NAME = 'invoice-data'
-VENDORS_BLOB = 'known_vendors.json'
-SCOPES = ['https://www.googleapis.com/auth/drive']
 
 app = func.FunctionApp()
 
-
-class MemoryCache(Cache):
-    _CACHE = {}
-
-    def get(self, url):
-        return MemoryCache._CACHE.get(url)
-
-    def set(self, url, content):
-        MemoryCache._CACHE[url] = content
-
-
-def get_blob_service_client():
-    connection_string = os.getenv('AzureWebJobsStorage')
-    if not connection_string:
-        raise ValueError("AzureWebJobsStorage connection string not found")
-    return BlobServiceClient.from_connection_string(connection_string)
-
-
-def initialize_drive_service():
+def process_invoice_file(file_id, drive_service, blob_service, pdf_service, file_service):
+    """Process a single invoice file.
+    
+    Args:
+        file_id: The Google Drive file ID of the PDF to process.
+        drive_service: The DriveService instance.
+        blob_service: The BlobService instance.
+        pdf_service: The PdfService instance.
+        file_service: The FileService instance.
+    
+    Returns:
+        True if processed successfully, False otherwise.
+    """
     try:
-        credentials_dict = {
-            "type": "service_account",
-            "project_id": os.getenv('project_id'),
-            "private_key_id": os.getenv('private_key_id'),
-            "private_key": os.getenv('private_key').replace('\\n', '\n'),
-            "client_email": os.getenv('client_email'),
-            "client_id": os.getenv('client_id'),
-            "auth_uri": os.getenv('auth_uri'),
-            "token_uri": os.getenv('token_uri'),
-            "auth_provider_x509_cert_url": os.getenv('auth_provider_x509_cert_url'),
-            "client_x509_cert_url": os.getenv('client_x509_cert_url')
-        }
-
-        credentials = service_account.Credentials.from_service_account_info(
-            credentials_dict, scopes=SCOPES
-        )
-
-        return build('drive', 'v3', credentials=credentials)
-    except Exception as e:
-        logging.error(f"Error initializing Drive service: {str(e)}")
-        raise
-
-
-def load_vendor_folders(drive_service):
-    try:
-        # First get all current folders from Drive
-        results = drive_service.files().list(
-            q=f"mimeType='application/vnd.google-apps.folder' and '{FOLDER_ID}' in parents",
-            fields="files(id, name)"
-        ).execute()
-
-        current_vendors = {folder['name']: folder['id']
-                           for folder in results.get('files', [])}
-
-        # Try to load existing vendors from blob
-        blob_service_client = get_blob_service_client()
-        blob_client = blob_service_client.get_blob_client(
-            container=CONTAINER_NAME,
-            blob=VENDORS_BLOB
-        )
-
-        try:
-            # Load existing vendors
-            existing_vendors = json.loads(
-                blob_client.download_blob().readall())
-
-            # Update with any new vendors
-            if existing_vendors != current_vendors:
-                logging.info("Updating vendors list with new folders")
-                save_vendor_folders(current_vendors)
-
-            return current_vendors
-
-        except Exception as e:
-            logging.info(f"No existing vendors file found or error: {str(e)}")
-            # Save the newly discovered vendors
-            save_vendor_folders(current_vendors)
-            return current_vendors
-
-    except Exception as e:
-        logging.error(f"Error loading vendor folders: {str(e)}")
-        return {}
-
-
-def save_vendor_folders(vendors):
-    try:
-        if not vendors:
-            logging.warning("Attempting to save empty vendors list")
-            return
-
-        blob_service_client = get_blob_service_client()
-        blob_client = blob_service_client.get_blob_client(
-            container=CONTAINER_NAME,
-            blob=VENDORS_BLOB
-        )
-        blob_client.upload_blob(json.dumps(vendors), overwrite=True)
-        logging.info(
-            f"Successfully saved {len(vendors)} vendors to blob storage")
-    except Exception as e:
-        logging.error(f"Error saving vendor folders: {str(e)}")
-
-
-def create_vendor_folder(drive_service, vendor_name):
-    try:
-        file_metadata = {
-            'name': vendor_name,
-            'mimeType': 'application/vnd.google-apps.folder',
-            'parents': [FOLDER_ID]
-        }
-        folder = drive_service.files().create(
-            body=file_metadata,
-            fields='id'
-        ).execute()
-        return folder.get('id')
-    except Exception as e:
-        logging.error(f"Error creating vendor folder: {str(e)}")
-        return None
-
-
-def process_new_files(drive_service, file_ids):
-    processor = PDFProcessor(drive_service)
-    organizer = FileOrganizer(drive_service)
-    vendors = load_vendor_folders(drive_service)
-
-    for file_id in file_ids:
-        try:
-            logging.info(f"Processing file {file_id}")
-            pdf_content = processor.download_file(file_id)
-            text = processor.extract_text(pdf_content)
-            vendor, date = processor.get_vendor_from_gpt(
-                list(vendors.keys()), text)
-
-            if vendor and date:
-                if vendor not in vendors:
-                    logging.info(f"Creating new vendor folder: {vendor}")
-                    folder_id = create_vendor_folder(drive_service, vendor)
-                    if folder_id:
-                        vendors[vendor] = folder_id
-                        save_vendor_folders(vendors)  # Save to blob storage
-
-                new_name = organizer.create_new_filename(vendor, date)
-                if new_name:
-                    target_folder = vendors.get(vendor)
-                    if target_folder:
-                        success = organizer.move_and_rename_file(
-                            file_id, new_name, target_folder)
-                        if success:
-                            logging.info(
-                                f"Successfully processed file: {new_name} to folder: {vendor}")
-                        else:
-                            logging.error(
-                                f"Failed to rename/move file {file_id}")
-                    else:
-                        logging.error(f"Vendor folder not found for {vendor}")
-            else:
-                logging.warning(
-                    f"Could not extract vendor/date from file {file_id}")
-        except Exception as e:
-            logging.error(f"Error processing file {file_id}: {str(e)}")
-
-
-@app.function_name("InvoiceProcessorTimer")
-@app.schedule(schedule="0 */1 * * * *", arg_name="mytimer", run_on_startup=True,
-              connection="AzureWebJobsStorage")
-def timer_trigger(mytimer: func.TimerRequest) -> None:
-    try:
-        utc_timestamp = datetime.now(timezone.utc).isoformat()
-        logging.info('Starting Azure Function file check at: %s', utc_timestamp)
-
-        drive_service = initialize_drive_service()
+        # Get vendor folders
+        vendors = drive_service.list_folders(FOLDER_ID)
         
-        # First, sync vendor folders
-        logging.info("Syncing vendor folders...")
-        vendors = load_vendor_folders(drive_service)
-        logging.info(f"Found {len(vendors)} vendor folders")
-
-        # Then process PDF files
-        results = drive_service.files().list(
-            q=f"mimeType='application/pdf' and '{FOLDER_ID}' in parents",
-            fields="files(id, name)",
-            orderBy="createdTime desc"
-        ).execute()
-
-        files = results.get('files', [])
-        if files:
-            logging.info(f"Found {len(files)} PDF files in Drive")
-            file_ids = [file['id'] for file in files]
-            process_new_files(drive_service, file_ids)
+        # Save vendor folders to blob storage
+        blob_service.save_vendors(vendors)
+        
+        # Process PDF file
+        vendor, date = pdf_service.process_file(file_id, list(vendors.keys()))
+        
+        if vendor and date:
+            # Create vendor folder if needed
+            if vendor not in vendors:
+                logging.info(f"Creating new vendor folder: {vendor}")
+                folder_id = file_service.create_vendor_folder(vendor, FOLDER_ID)
+                
+                if folder_id:
+                    vendors[vendor] = folder_id
+                    blob_service.save_vendors(vendors)
+                else:
+                    logging.error(f"Failed to create vendor folder for {vendor}")
+                    return False
+            
+            # Move file to vendor folder
+            target_folder_id = vendors.get(vendor)
+            if target_folder_id:
+                return file_service.move_to_vendor_folder(file_id, vendor, date, target_folder_id)
+            else:
+                logging.error(f"Vendor folder ID not found for {vendor}")
+                return False
         else:
-            logging.info("No PDF files found in Drive")
-
+            logging.warning(f"Could not extract vendor/date from file {file_id}")
+            return False
     except Exception as e:
-        logging.error(f"Timer trigger failed: {str(e)}")
-        raise
+        logging.error(f"Error processing invoice file {file_id}: {str(e)}")
+        return False
 
-    logging.info('Python timer trigger function completed at %s', utc_timestamp)
+def process_new_files(drive_service, blob_service, pdf_service, file_service, last_check_time=None):
+    """Process new PDF files in Google Drive.
+    
+    Args:
+        drive_service: The DriveService instance.
+        blob_service: The BlobService instance.
+        pdf_service: The PdfService instance.
+        file_service: The FileService instance.
+        last_check_time: Optional time to filter files created after.
+        
+    Returns:
+        The number of files processed successfully.
+    """
+    try:
+        # Get files created after last_check_time
+        files = drive_service.list_pdf_files(FOLDER_ID, last_check_time)
+        
+        if not files:
+            logging.info("No new PDF files found in Drive")
+            return 0
+            
+        logging.info(f"Found {len(files)} PDF files to process")
+        
+        # Process each file
+        successes = 0
+        for file in files:
+            file_id = file['id']
+            if process_invoice_file(file_id, drive_service, blob_service, pdf_service, file_service):
+                successes += 1
+                
+        logging.info(f"Successfully processed {successes} of {len(files)} files")
+        return successes
+    except Exception as e:
+        logging.error(f"Error processing new files: {str(e)}")
+        return 0
+
+# Webhook handler
+@app.function_name("InvoiceProcessorWebhook")
+@app.route(route="gdrive-webhook", auth_level=func.AuthLevel.FUNCTION)
+def webhook_trigger(req: func.HttpRequest) -> func.HttpResponse:
+    """Handle Google Drive webhook notifications."""
+    try:
+        logging.info('Google Drive webhook received')
+        
+        # Get resource state from headers
+        state = req.headers.get('X-Goog-Resource-State')
+        logging.info(f"Resource state: {state}")
+        
+        # Handle subscription verification
+        if state == 'sync':
+            logging.info('Received subscription verification request')
+            return func.HttpResponse("Webhook verified", status_code=200)
+        
+        # Handle file changes
+        if state in ('change', 'update'):
+            logging.info(f"Processing {state} notification")
+            
+            # Create services
+            drive_service = DriveService()
+            blob_service = BlobService()
+            pdf_service = PdfService(drive_service)
+            file_service = FileService(drive_service)
+            
+            # Verify channel ID
+            channel_id = req.headers.get('X-Goog-Channel-ID')
+            stored_channel_id = blob_service.get_channel_id()
+            
+            if stored_channel_id and channel_id != stored_channel_id:
+                logging.warning(f"Received notification for unknown channel: {channel_id}")
+                return func.HttpResponse("Unknown channel", status_code=400)
+            
+            # Get current time
+            current_time = datetime.now(timezone.utc).isoformat()
+            
+            # Get last check time
+            last_check_time = blob_service.get_last_check_time()
+            
+            # Process new files
+            processed = process_new_files(
+                drive_service, blob_service, pdf_service, file_service, last_check_time
+            )
+            
+            # Save current time as last check time
+            blob_service.save_last_check_time(current_time)
+            
+            return func.HttpResponse(f"Processed {processed} files", status_code=200)
+        
+        # Handle other resource states
+        return func.HttpResponse(f"Ignored state: {state}", status_code=200)
+        
+    except Exception as e:
+        error_msg = f"Error processing webhook: {str(e)}"
+        logging.error(error_msg)
+        return func.HttpResponse(error_msg, status_code=500)
+
+# Timer trigger for setting up webhook
+@app.function_name("DriveWatchSetup")
+@app.timer_trigger(schedule="0 0 */12 * * *", arg_name="myTimer", run_on_startup=True)
+def setup_watch(myTimer: func.TimerRequest) -> None:
+    """Set up Google Drive webhook notification."""
+    try:
+        logging.info("Setting up Google Drive watch notification")
+        
+        # Create services
+        drive_service = DriveService()
+        blob_service = BlobService()
+        
+        # Get webhook URL from environment
+        webhook_url = os.getenv('FUNCTION_WEBHOOK_URL')
+        if not webhook_url:
+            logging.error("FUNCTION_WEBHOOK_URL environment variable not set")
+            return
+        
+        # Set up webhook
+        response, channel_id = drive_service.setup_webhook(FOLDER_ID, webhook_url)
+        
+        # Save channel ID
+        blob_service.save_channel_id(channel_id)
+        
+        logging.info(f"Google Drive watch notification set up successfully: {response}")
+        
+    except Exception as e:
+        logging.error(f"Error setting up Google Drive watch: {str(e)}")
+
+# Manual webhook setup
+@app.function_name("ManualDriveSetup")
+@app.route(route="setup-webhook", auth_level=func.AuthLevel.FUNCTION)
+def manual_setup(req: func.HttpRequest) -> func.HttpResponse:
+    """Manually trigger Google Drive webhook setup."""
+    try:
+        logging.info("Manually setting up Google Drive watch notification")
+        
+        # Create services
+        drive_service = DriveService()
+        blob_service = BlobService()
+        
+        # Get webhook URL from environment
+        webhook_url = os.getenv('FUNCTION_WEBHOOK_URL')
+        if not webhook_url:
+            return func.HttpResponse(
+                "FUNCTION_WEBHOOK_URL environment variable not set",
+                status_code=400
+            )
+        
+        # Set up webhook
+        response, channel_id = drive_service.setup_webhook(FOLDER_ID, webhook_url)
+        
+        # Save channel ID
+        blob_service.save_channel_id(channel_id)
+        
+        logging.info(f"Google Drive watch notification set up successfully: {response}")
+        
+        return func.HttpResponse(
+            f"Google Drive webhook setup successful. Channel ID: {channel_id}",
+            status_code=200
+        )
+        
+    except Exception as e:
+        error_msg = f"Error setting up Google Drive watch: {str(e)}"
+        logging.error(error_msg)
+        return func.HttpResponse(
+            error_msg,
+            status_code=500
+        )
