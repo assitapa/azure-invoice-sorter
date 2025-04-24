@@ -162,8 +162,8 @@ def webhook_trigger(req: func.HttpRequest) -> func.HttpResponse:
 
 # Timer trigger for setting up webhook
 @app.function_name("DriveWatchSetup")
-@app.timer_trigger(schedule="0 0 */12 * * *", arg_name="myTimer", run_on_startup=True)
-def setup_watch(myTimer: func.TimerRequest) -> None:
+@app.timer_trigger(schedule="0 0 */6 * * *", arg_name="myTimer", run_on_startup=True)
+async def setup_watch(myTimer: func.TimerRequest) -> None:
     """Set up Google Drive webhook notification."""
     try:
         logging.info("Setting up Google Drive watch notification")
@@ -178,16 +178,22 @@ def setup_watch(myTimer: func.TimerRequest) -> None:
             logging.error("FUNCTION_WEBHOOK_URL environment variable not set")
             return
         
-        # Set up webhook
-        response, channel_id = drive_service.setup_webhook(FOLDER_ID, webhook_url)
-        
-        # Save channel ID
-        blob_service.save_channel_id(channel_id)
-        
-        logging.info(f"Google Drive watch notification set up successfully: {response}")
+        # Set up webhook using same approach as manual function
+        try:
+            response, channel_id = drive_service.setup_webhook(FOLDER_ID, webhook_url)
+            
+            # Save channel ID
+            blob_service.save_channel_id(channel_id)
+            
+            logging.info(f"Google Drive watch notification set up successfully: {response}")
+            logging.info(f"Google Drive webhook setup successful. Channel ID: {channel_id}")
+        except Exception as setup_error:
+            logging.error(f"Failed to set up webhook: {str(setup_error)}")
+            raise setup_error
         
     except Exception as e:
         logging.error(f"Error setting up Google Drive watch: {str(e)}")
+        logging.exception("Full exception details:")
 
 # Manual webhook setup
 @app.function_name("ManualDriveSetup")
